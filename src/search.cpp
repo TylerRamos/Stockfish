@@ -1145,7 +1145,8 @@ moves_loop:  // When in check, search starts here
 
     value = bestValue;
 
-    int moveCount = 0;
+    int  moveCount         = 0;
+    bool futilityBestValue = false;
 
     // Step 14. Loop through all legal moves until no moves remain
     // or a beta cutoff occurs.
@@ -1246,7 +1247,10 @@ moves_loop:  // When in check, search starts here
                 {
                     if (bestValue <= futilityValue && !is_decisive(bestValue)
                         && !is_win(futilityValue))
-                        bestValue = futilityValue;
+                    {
+                        bestValue         = futilityValue;
+                        futilityBestValue = true;
+                    }
                     continue;
                 }
 
@@ -1544,7 +1548,8 @@ moves_loop:  // When in check, search starts here
 
         if (value + inc > bestValue)
         {
-            bestValue = value;
+            bestValue         = value;
+            futilityBestValue = false;
 
             if (value + inc > alpha)
             {
@@ -1660,8 +1665,9 @@ moves_loop:  // When in check, search starts here
                        unadjustedStaticEval, tt.generation());
 
     // Adjust correction history if the best move is not a capture and
-    // the error direction matches whether we are above/below bounds.
-    if (!ss->inCheck && !(bestMove && pos.capture(bestMove))
+    // the error direction matches whether we are above/below bounds. Skip it
+    // when bestValue is a futility estimate rather than a searched value.
+    if (!ss->inCheck && !(bestMove && pos.capture(bestMove)) && !futilityBestValue
         && (bestValue > ss->staticEval) == bool(bestMove))
     {
         auto bonus =
