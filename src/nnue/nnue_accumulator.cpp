@@ -131,6 +131,7 @@ void AccumulatorStack::evaluate_side(Color                     perspective,
             && pos.count<ALL_PIECES>() >= MIN_PC_COUNT_HYBRID
             && ((int(dirtyPiece.from) & 0b100) == (int(dirtyPiece.to) & 0b100))
             && dirtyPiece.add_sq == SQ_NONE  // excludes castling
+            && !latest().dirtyGhosts.overflow
         )
         {
             update_accumulator_hybrid(perspective, pos, featureTransformer, mut_latest(),
@@ -154,7 +155,8 @@ usize AccumulatorStack::find_last_usable_accumulator(Color perspective) const no
 
         // Threat feature set refreshes require a king move across the center, i.e.,
         // a subset of halfka refreshes
-        if (PSQFeatureSet::requires_refresh(accumulators[curr_idx].dirtyPiece, perspective))
+        if (PSQFeatureSet::requires_refresh(accumulators[curr_idx].dirtyPiece, perspective)
+            || accumulators[curr_idx].dirtyGhosts.overflow)
             return curr_idx;
     }
 
@@ -440,26 +442,10 @@ sf_always_inline Tile apply_feature_pair(Tile acc, const i8* data0, const i8* da
 #endif
 
 // The weight-table base already includes the tile offset.
-template<int sign, bool Incremental = false>
+template<int sign>
 sf_always_inline Tile
 apply_features(IndexType j, Tile acc, const u16* indices, int count, const i8* weights) {
     static_assert(sign == 1 || sign == -1);
-    if constexpr (Incremental)
-    {
-        assert(count >= 0 && count <= 2);
-#if defined(VECTOR) || defined(USE_RVV)
-    #if defined(USE_PAIRED_WIDENING_ADD)
-        if (count == 2)
-            return apply_feature_pair<sign>(acc, &weights[usize(indices[0]) * Dimensions],
-                                            &weights[usize(indices[1]) * Dimensions]);
-    #endif
-        if (count > 0)
-            acc = apply_feature_single<sign>(j, acc, &weights[usize(indices[0]) * Dimensions]);
-        if (count > 1)
-            acc = apply_feature_single<sign>(j, acc, &weights[usize(indices[1]) * Dimensions]);
-        return acc;
-#endif
-    }
 
     int i = 0;
 #if defined(USE_PAIRED_WIDENING_ADD)
@@ -469,6 +455,19 @@ apply_features(IndexType j, Tile acc, const u16* indices, int count, const i8* w
 #endif
     for (; i < count; ++i)
         acc = apply_feature_single<sign>(j, acc, &weights[usize(indices[i]) * Dimensions]);
+    return acc;
+}
+
+// Rows given as pointers to their first weight; the tile offset j is added here.
+template<int sign>
+sf_always_inline Tile apply_rows(IndexType j, Tile acc, const i8* const* rows, int count) {
+    int i = 0;
+#if defined(USE_PAIRED_WIDENING_ADD)
+    for (; i + 1 < count; i += 2)
+        acc = apply_feature_pair<sign>(acc, rows[i] + j, rows[i + 1] + j);
+#endif
+    for (; i < count; ++i)
+        acc = apply_feature_single<sign>(j, acc, rows[i] + j);
     return acc;
 }
 
@@ -488,15 +487,12 @@ sf_always_inline Tile apply_threat_features(IndexType                          j
     return apply_features<sign>(j, acc, list.begin(), list.ssize(), &ft.threatAndPpWeights[j]);
 }
 
-template<int sign, bool Incremental = false>
+template<int sign>
 sf_always_inline Tile apply_combined_features(IndexType                          j,
                                               Tile                               acc,
                                               const PSQFeatureSet::IndexList&    psq,
                                               const ThreatFeatureSet::IndexList& thr,
                                               const FeatureTransformer&          ft) {
-    if constexpr (Incremental)
-        assert(psq.size() == 1 || psq.size() == 2);
-
     const auto* psqWeights = &ft.weights[j];
     const auto* thrWeights = &ft.threatAndPpWeights[j];
     int         psqCount   = psq.ssize();
@@ -510,7 +506,7 @@ sf_always_inline Tile apply_combined_features(IndexType                         
     }
 #endif
 
-    acc = apply_features<sign, Incremental>(j, acc, psq.begin(), psqCount, psqWeights);
+    acc = apply_features<sign>(j, acc, psq.begin(), psqCount, psqWeights);
 #if defined(USE_PAIRED_WIDENING_ADD)
     if (thrBegin)
         acc = apply_feature_pair<sign>(acc, &psqWeights[usize(psq[psqCount]) * Dimensions],
@@ -519,17 +515,38 @@ sf_always_inline Tile apply_combined_features(IndexType                         
     return apply_features<sign>(j, acc, thr.begin() + thrBegin, thr.ssize() - thrBegin, thrWeights);
 }
 
-void apply_combined(Color                              perspective,
-                    const FeatureTransformer&          featureTransformer,
-                    const AccumulatorState&            from,
-                    AccumulatorState&                  to,
-                    const PSQFeatureSet::IndexList&    psqAdded,
-                    const PSQFeatureSet::IndexList&    psqRemoved,
-                    const ThreatFeatureSet::IndexList& thrAdded,
-                    const ThreatFeatureSet::IndexList& thrRemoved) {
+void apply_combined(Color                               perspective,
+                    const FeatureTransformer&           featureTransformer,
+                    const AccumulatorState&             from,
+                    AccumulatorState&                   to,
+                    const PSQFeatureSet::IndexList&     psqAdded,
+                    const PSQFeatureSet::IndexList&     psqRemoved,
+                    const ThreatFeatureSet::IndexList&  thrAdded,
+                    const ThreatFeatureSet::IndexList&  thrRemoved,
+                    const GhostFeatureSet::ChangedList& ghostAdded,
+                    const GhostFeatureSet::ChangedList& ghostRemoved) {
 
     const auto& fromAcc = from.accumulation[perspective];
     auto&       toAcc   = to.accumulation[perspective];
+
+    // Gather all rows (psq, threat/pp, ghost) as row pointers so that they pair up
+    // across feature sets in the widening adds.
+    constexpr int MaxRows = 4 + ThreatFeatureSet::MaxActiveDimensions + DirtyGhosts::MaxSize;
+    const i8*     rem[MaxRows];
+    const i8*     add[MaxRows];
+    int           nRem = 0, nAdd = 0;
+    for (auto idx : psqRemoved)
+        rem[nRem++] = &featureTransformer.weights[usize(idx) * Dimensions];
+    for (auto idx : thrRemoved)
+        rem[nRem++] = &featureTransformer.threatAndPpWeights[usize(idx) * Dimensions];
+    for (auto idx : ghostRemoved)
+        rem[nRem++] = &featureTransformer.ghostWeights[usize(idx) * Dimensions];
+    for (auto idx : psqAdded)
+        add[nAdd++] = &featureTransformer.weights[usize(idx) * Dimensions];
+    for (auto idx : thrAdded)
+        add[nAdd++] = &featureTransformer.threatAndPpWeights[usize(idx) * Dimensions];
+    for (auto idx : ghostAdded)
+        add[nAdd++] = &featureTransformer.ghostWeights[usize(idx) * Dimensions];
 
     Tile acc;
 
@@ -537,8 +554,8 @@ void apply_combined(Color                              perspective,
     {
         acc = load_tile(j, fromAcc.data());
 
-        acc = apply_combined_features<-1, true>(j, acc, psqRemoved, thrRemoved, featureTransformer);
-        acc = apply_combined_features<+1, true>(j, acc, psqAdded, thrAdded, featureTransformer);
+        acc = apply_rows<-1>(j, acc, rem, nRem);
+        acc = apply_rows<+1>(j, acc, add, nAdd);
 
         store_tile(j, toAcc.data(), acc);
     }
@@ -565,6 +582,8 @@ void update_accumulator_incremental(Color                     perspective,
     const auto& dirtyPiece     = Forward ? target_state.dirtyPiece : computed.dirtyPiece;
     const auto& dirtyThreats   = Forward ? target_state.dirtyThreats : computed.dirtyThreats;
     const auto& dirtyPawnPairs = Forward ? target_state.dirtyPawnPairs : computed.dirtyPawnPairs;
+    const auto& dirtyGhosts    = Forward ? target_state.dirtyGhosts : computed.dirtyGhosts;
+    GhostFeatureSet::ChangedList ghostRemoved, ghostAdded;
 
     // Used solely for prefetching
     const auto* threatPpBase = &featureTransformer.threatAndPpWeights[0];
@@ -578,6 +597,8 @@ void update_accumulator_incremental(Color                     perspective,
                                                thrAdded, threatPpBase, pfStride);
         PSQFeatureSet::append_changed_indices(perspective, ksq, dirtyPiece, opponentHasQueen,
                                               psqRemoved, psqAdded);
+        GhostFeatureSet::append_changed_indices(perspective, ksq, dirtyGhosts, ghostRemoved,
+                                                ghostAdded, &featureTransformer.ghostWeights[0]);
     }
     else
     {
@@ -587,10 +608,12 @@ void update_accumulator_incremental(Color                     perspective,
                                                thrRemoved, threatPpBase, pfStride);
         PSQFeatureSet::append_changed_indices(perspective, ksq, dirtyPiece, opponentHasQueen,
                                               psqAdded, psqRemoved);
+        GhostFeatureSet::append_changed_indices(perspective, ksq, dirtyGhosts, ghostAdded,
+                                                ghostRemoved, &featureTransformer.ghostWeights[0]);
     }
 
     apply_combined(perspective, featureTransformer, computed, target_state, psqAdded, psqRemoved,
-                   thrAdded, thrRemoved);
+                   thrAdded, thrRemoved, ghostAdded, ghostRemoved);
 
     target_state.computed[perspective] = true;
 }
@@ -624,11 +647,17 @@ void update_accumulator_incremental_both(const FeatureTransformer& featureTransf
                                           psq_removed[WHITE], psq_added[WHITE]);
     PSQFeatureSet::append_changed_indices(BLACK, black_ksq, target_state.dirtyPiece, blackOppQueen,
                                           psq_removed[BLACK], psq_added[BLACK]);
+    GhostFeatureSet::ChangedList ghost_removed[COLOR_NB], ghost_added[COLOR_NB];
+    GhostFeatureSet::append_changed_indices_both(white_ksq, black_ksq, target_state.dirtyGhosts,
+                                                 ghost_removed, ghost_added,
+                                                 &featureTransformer.ghostWeights[0]);
 
     apply_combined(WHITE, featureTransformer, computed, target_state, psq_added[WHITE],
-                   psq_removed[WHITE], thr_added[WHITE], thr_removed[WHITE]);
+                   psq_removed[WHITE], thr_added[WHITE], thr_removed[WHITE], ghost_added[WHITE],
+                   ghost_removed[WHITE]);
     apply_combined(BLACK, featureTransformer, computed, target_state, psq_added[BLACK],
-                   psq_removed[BLACK], thr_added[BLACK], thr_removed[BLACK]);
+                   psq_removed[BLACK], thr_added[BLACK], thr_removed[BLACK], ghost_added[BLACK],
+                   ghost_removed[BLACK]);
 
     target_state.computed[WHITE] = true;
     target_state.computed[BLACK] = true;
@@ -837,6 +866,9 @@ void update_accumulator_hybrid(Color                     perspective,
                                              thrAdded, threatPpBase, pfStride);
     PairFeatureSet::append_changed_indices(perspective, newKsq, target.dirtyPawnPairs, thrRemoved,
                                            thrAdded, threatPpBase, pfStride);
+    GhostFeatureSet::ChangedList ghostRemoved, ghostAdded;
+    GhostFeatureSet::append_changed_indices(perspective, newKsq, target.dirtyGhosts, ghostRemoved,
+                                            ghostAdded, &featureTransformer.ghostWeights[0]);
 
     const auto& fromAcc = computed.accumulation[perspective];
     auto&       toAcc   = target.accumulation[perspective];
@@ -863,6 +895,10 @@ void update_accumulator_hybrid(Color                     perspective,
         // The old entry's removed psq features have to be added back, its added ones removed
         acc = apply_combined_features<-1>(j, acc, oldAdd, thrRemoved, featureTransformer);
         acc = apply_combined_features<+1>(j, acc, oldRemove, thrAdded, featureTransformer);
+        acc = apply_features<-1>(j, acc, ghostRemoved.begin(), ghostRemoved.ssize(),
+                                 &featureTransformer.ghostWeights[j]);
+        acc = apply_features<+1>(j, acc, ghostAdded.begin(), ghostAdded.ssize(),
+                                 &featureTransformer.ghostWeights[j]);
 
         store_tile(j, toAcc.data(), acc);
     }
@@ -895,6 +931,8 @@ void update_accumulator_refresh_cache(Color                     perspective,
     ThreatFeatureSet::IndexList active;
     ThreatFeatureSet::append_active_indices(perspective, pos, active);
     PairFeatureSet::append_active_indices(perspective, pos, active);
+    GhostFeatureSet::IndexList ghostActive;
+    GhostFeatureSet::append_active_indices(perspective, pos, ghostActive);
 
     accumulator.computed[perspective] = true;
 
@@ -910,6 +948,8 @@ void update_accumulator_refresh_cache(Color                     perspective,
         store_tile(j, &entry.accumulation[0], acc);
 
         acc = apply_threat_features<+1>(j, acc, active, featureTransformer);
+        acc = apply_features<+1>(j, acc, ghostActive.begin(), ghostActive.ssize(),
+                                 &featureTransformer.ghostWeights[j]);
 
         store_tile(j, accumulator.accumulation[perspective].data(), acc);
     }
@@ -917,17 +957,28 @@ void update_accumulator_refresh_cache(Color                     perspective,
 
 }
 
-void add_ghost_pawn_features(const Position& pos, const FeatureTransformer& ft,
-                             std::array<std::array<i16, L1>, COLOR_NB>& accumulation) {
-    GhostFeatureSet::IndexList indices[COLOR_NB];
-    GhostFeatureSet::append_active_indices_both(pos, indices[WHITE], indices[BLACK]);
+// En passant ghost features depend on the side to move, so they are not kept in the
+// accumulator but added at evaluation time.
+void add_ghost_ep_features(const Position&                            pos,
+                           const FeatureTransformer&                  ft,
+                           Square                                     ep,
+                           std::array<std::array<i16, L1>, COLOR_NB>& accumulation) {
     for (Color c : {WHITE, BLACK})
+    {
+        GhostFeatureSet::IndexList indices;
+        for (Bitboard b = pos.attackers_to(ep); b;)
+        {
+            const Square from = pop_lsb(b);
+            indices.push_back(GhostFeatureSet::make_index(c, pos.side_to_move(), pos.piece_on(from),
+                                                          from, ep, pos.square<KING>(c)));
+        }
         for (IndexType j = 0; j < Dimensions; increment_index(j))
         {
             auto acc = load_tile(j, accumulation[c].data());
-            acc = apply_features<1>(j, acc, indices[c].begin(), indices[c].ssize(), &ft.ghostWeights[j]);
+            acc = apply_features<1>(j, acc, indices.begin(), indices.ssize(), &ft.ghostWeights[j]);
             store_tile(j, accumulation[c].data(), acc);
         }
+    }
 }
 
 }

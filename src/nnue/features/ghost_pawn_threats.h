@@ -34,16 +34,34 @@ class GhostPawnThreats {
     // At most 32 pieces, each with <=27 attacks, for two ghost colors.
     static constexpr IndexType MaxActiveDimensions = 2048;
     using IndexList = ValueList<u16, MaxActiveDimensions>;
+    using ChangedList                              = ValueList<u16, DirtyGhosts::MaxSize>;
+
+    // Ghost squares without en passant, which depends on the side to move
     static std::array<Bitboard, COLOR_NB> destinations(const Position& pos);
+    static Square                         ep_destination(const Position& pos);
+    // Ghost squares that appeared or disappeared in the move, with their new attackers
+    static void      compute_delta(const Position&                       pos,
+                                   const std::array<Bitboard, COLOR_NB>& oldGhosts,
+                                   DirtyGhosts&                          dirty);
     static IndexType make_index(Color perspective,
                                 Color ghostColor,
                                 Piece attacker,
                                 Square from,
                                 Square to,
                                 Square ksq);
-    static void append_active_indices_both(const Position& pos,
-                                           IndexList& white,
-                                           IndexList& black);
+    static void append_active_indices(Color perspective, const Position& pos, IndexList& active);
+    static void append_changed_indices(Color              perspective,
+                                       Square             ksq,
+                                       const DirtyGhosts& diff,
+                                       ChangedList&       removed,
+                                       ChangedList&       added,
+                                       const i8*          prefetchBase);
+    static void append_changed_indices_both(Square             whiteKsq,
+                                            Square             blackKsq,
+                                            const DirtyGhosts& diff,
+                                            ChangedList        removed[COLOR_NB],
+                                            ChangedList        added[COLOR_NB],
+                                            const i8*          prefetchBase);
 };
 }
 #endif

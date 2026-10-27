@@ -37,8 +37,10 @@ class Position;
 namespace Stockfish::Eval::NNUE {
 
 class FeatureTransformer;
-void add_ghost_pawn_features(const Position& pos, const FeatureTransformer& ft,
-                             std::array<std::array<i16, L1>, COLOR_NB>& accumulation);
+void add_ghost_ep_features(const Position&                            pos,
+                           const FeatureTransformer&                  ft,
+                           Square                                     ep,
+                           std::array<std::array<i16, L1>, COLOR_NB>& accumulation);
 
 // Class that holds the result of affine transformation of input features,
 // combined HalfKA + Threats

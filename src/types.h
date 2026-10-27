@@ -351,10 +351,32 @@ struct DirtyPawnPairs {
     Bitboard after[COLOR_NB];
 };
 
+// Changed ghost pawn threat features of a move, independent of the perspective.
+// Entry: to (bits 0-7), from (8-15), attacker (16-19), ghost color (24), add (31).
+// On overflow (never seen, the maximum is about 40) the accumulator is refreshed.
+struct DirtyGhosts {
+    static constexpr int MaxSize = 128;
+    u32                  list[MaxSize];
+    int                  size;
+    bool                 overflow;
+
+    void push(u32 v) {
+        if (size < MaxSize)
+            list[size++] = v;
+        else
+            overflow = true;
+    }
+
+    static constexpr u32 encode(bool add, Color gc, Piece pc, Square from, Square to) {
+        return (u32(add) << 31) | (u32(gc) << 24) | (u32(pc) << 16) | (u32(from) << 8) | u32(to);
+    }
+};
+
 struct Dirties {
     DirtyPiece     dirtyPiece;
     DirtyThreats   dirtyThreats;
     DirtyPawnPairs dirtyPawnPairs;
+    DirtyGhosts    dirtyGhosts;
 };
 
     #define ENABLE_INCR_OPERATORS_ON(T) \

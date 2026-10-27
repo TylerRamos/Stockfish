@@ -64,6 +64,7 @@ struct StateInfo {
     Bitboard   threats[PIECE_TYPE_NB];
     Piece      capturedPiece;
     int        repetition;
+    std::array<Bitboard, COLOR_NB> ghostSquares;  // Without en passant
 };
 
 
@@ -122,6 +123,7 @@ class Position {
     // Checking
     Bitboard checkers() const;
     Bitboard blockers_for_king(Color c) const;
+    Bitboard ghost_squares(Color c) const;
     Bitboard check_squares(PieceType pt) const;
     Bitboard pinners(Color c) const;
 
@@ -227,6 +229,7 @@ class Position {
     Color      sideToMove;
     bool       chess960;
     Dirties    scratchDirties;
+    DirtyGhosts* dirtyGhosts;
 };
 
 std::ostream& operator<<(std::ostream& os, const Position& pos);
@@ -315,6 +318,8 @@ inline Bitboard Position::threats_by(PieceType pt) const {
 inline Bitboard Position::checkers() const { return st->checkersBB; }
 
 inline Bitboard Position::blockers_for_king(Color c) const { return st->blockersForKing[c]; }
+
+inline Bitboard Position::ghost_squares(Color c) const { return st->ghostSquares[c]; }
 
 inline Bitboard Position::pinners(Color c) const { return st->pinners[c]; }
 

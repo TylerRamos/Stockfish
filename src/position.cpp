@@ -35,6 +35,7 @@
 #include "history.h"
 #include "misc.h"
 #include "movegen.h"
+#include "nnue/features/ghost_pawn_threats.h"
 #include "syzygy/tbprobe.h"
 #include "uci.h"
 
@@ -508,6 +509,7 @@ void Position::set_state() const {
     st->checkersBB = attackers_to(square<KING>(sideToMove)) & pieces(~sideToMove);
 
     set_extra_bitboards();
+    st->ghostSquares = Eval::NNUE::Features::GhostPawnThreats::destinations(*this);
 
     for (Bitboard b = pieces(); b;)
     {
@@ -828,6 +830,11 @@ void Position::do_move(
     assert(captured == NO_PIECE || color_of(captured) == (m.type_of() != CASTLING ? them : us));
     assert(type_of(captured) != KING);
 
+    // Attack changes onto the old ghost squares are added by update_piece_threats()
+    dirtyGhosts           = &dirties.dirtyGhosts;
+    dirtyGhosts->size     = 0;
+    dirtyGhosts->overflow = false;
+
     if (m.type_of() == CASTLING)
     {
         assert(pc == make_piece(us, KING));
@@ -1014,6 +1021,10 @@ void Position::do_move(
     // Update king attacks used for fast check detection
     set_extra_bitboards();
 
+    st->ghostSquares = Eval::NNUE::Features::GhostPawnThreats::destinations(*this);
+    Eval::NNUE::Features::GhostPawnThreats::compute_delta(*this, st->previous->ghostSquares,
+                                                          *dirtyGhosts);
+
     // Calculate the repetition info. It is the ply distance from the previous
     // occurrence of the same position, negative in the 3-fold case, or zero
     // if the position was not repeated.
@@ -1168,6 +1179,22 @@ void Position::update_piece_threats(Piece               pc,
     const PieceType pt              = type_of(pc);
     const Bitboard  sliders = (pieces(BISHOP, QUEEN) & bAttacks) | (pieces(ROOK, QUEEN) & rAttacks);
 
+    const Bitboard attacks = pt == BISHOP ? bAttacks
+                           : pt == ROOK   ? rAttacks
+                           : pt == QUEEN  ? sliderAttacks
+                           : pt == PAWN   ? PseudoAttacks[color_of(pc)][s]
+                                          : PseudoAttacks[pt][s];
+
+    // Ghost features: attack changes onto the ghost squares before the move
+    const auto& ghosts    = st->previous->ghostSquares;
+    auto        addGhosts = [&](bool add, Piece attacker, Square from, Bitboard targets) {
+        if (targets & (ghosts[WHITE] | ghosts[BLACK]))
+            for (Color gc : {WHITE, BLACK})
+                for (Bitboard b = targets & ghosts[gc]; b;)
+                    dirtyGhosts->push(DirtyGhosts::encode(add, gc, attacker, from, pop_lsb(b)));
+    };
+    addGhosts(putPiece, pc, s, attacks);
+
     auto process_sliders = [&](bool addDirectAttacks) {
         Bitboard b = sliders;
         while (b)
@@ -1177,6 +1204,9 @@ void Position::update_piece_threats(Piece               pc,
 
             const Bitboard ray        = ray_pass_bb(sliderSq, s);
             const Bitboard discovered = ray & sliderAttacks & occupiedNoK;
+
+            // Squares behind s are revealed (remove) or hidden (put)
+            addGhosts(!putPiece, slider, sliderSq, ray & sliderAttacks & ~between_bb(sliderSq, s));
 
             assert(!more_than_one(discovered));
             if (discovered && (ray & noRaysContaining) != noRaysContaining)
@@ -1203,12 +1233,7 @@ void Position::update_piece_threats(Piece               pc,
     const Bitboard threatTargets = pt == PAWN                 ? pieces(KNIGHT, ROOK)
                                  : pt == BISHOP || pt == ROOK ? pieces(PAWN, KNIGHT, BISHOP, ROOK)
                                                               : occupiedNoK;
-    Bitboard       threatened    = (pt == BISHOP  ? bAttacks
-                                    : pt == ROOK  ? rAttacks
-                                    : pt == QUEEN ? sliderAttacks
-                                    : pt == PAWN  ? PseudoAttacks[color_of(pc)][s]
-                                                  : PseudoAttacks[pt][s])
-                        & threatTargets;
+    Bitboard       threatened      = attacks & threatTargets;
     Bitboard incomingThreats = PseudoAttacks[KNIGHT][s] & pieces(KNIGHT);
 
     if (pt == KNIGHT || pt == ROOK)

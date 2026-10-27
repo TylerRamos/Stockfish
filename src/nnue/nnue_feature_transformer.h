@@ -259,9 +259,15 @@ class FeatureTransformer {
         const auto& accumulatorState = accumulatorStack.latest();
 
         const Color perspectives[2] = {pos.side_to_move(), ~pos.side_to_move()};
-        // Ghosts are recomputed for this position and never contaminate incremental caches.
-        alignas(CacheLineSize) auto accumulation = accumulatorState.accumulation;
-        add_ghost_pawn_features(pos, *this, accumulation);
+        // En passant ghost features are not in the accumulator
+        alignas(CacheLineSize) decltype(accumulatorState.accumulation) epAccumulation;
+        const Square ep = GhostFeatureSet::ep_destination(pos);
+        if (ep != SQ_NONE) [[unlikely]]
+        {
+            epAccumulation = accumulatorState.accumulation;
+            add_ghost_ep_features(pos, *this, ep, epAccumulation);
+        }
+        const auto& accumulation = ep != SQ_NONE ? epAccumulation : accumulatorState.accumulation;
 
         for (IndexType p = 0; p < 2; ++p)
             transform_perspective(accumulation[perspectives[p]], output, p, nnzInfo);
