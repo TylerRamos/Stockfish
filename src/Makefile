@@ -943,6 +943,30 @@ ifneq ($(ARCH), )
 	CXXFLAGS += -DARCH=$(ARCH)
 endif
 
+### 3.8.3 Hardening defaults
+### Many Linux distributions (e.g. Ubuntu, Fedora) configure their compilers to build
+### position-independent executables with control-flow protection and stack clash
+### probes by default. These cost speed and are not needed here.
+ifeq ($(optimize),yes)
+ifeq ($(TARGET_KERNEL),Linux)
+ifneq ($(OS), Android)
+ifeq ($(comp),$(filter $(comp),gcc clang))
+	CXXFLAGS += -fno-pie
+	LDFLAGS += -no-pie
+	ifeq ($(arch),$(filter $(arch),x86_64 i386))
+		CXXFLAGS += -fcf-protection=none
+	endif
+	# -fno-stack-clash-protection needs clang >= 11
+	ifeq ($(comp)$(gccisclang),gcc)
+		CXXFLAGS += -fno-stack-clash-protection
+	else ifeq ($(shell test "$$($(CXX) -dumpversion 2>/dev/null | cut -f1 -d.)" -ge 11 2>/dev/null && echo yes),yes)
+		CXXFLAGS += -fno-stack-clash-protection
+	endif
+endif
+endif
+endif
+endif
+
 ### 3.9 Link Time Optimization
 ### This is a mix of compile and link time options because the lto link phase
 ### needs access to the optimization flags.
@@ -1441,7 +1465,7 @@ else ifeq ($(TARGET_KERNEL),Linux)
   ifeq ($(COMP),ndk)
     UNIVERSAL_FINAL_FLAGS += -static
   else
-    UNIVERSAL_FINAL_FLAGS += -lrt -lpthread
+    UNIVERSAL_FINAL_FLAGS += -lrt -lpthread -no-pie
   endif
 else    # windows
   UNIVERSAL_FINAL_FLAGS += -Wl,--allow-multiple-definition -static
